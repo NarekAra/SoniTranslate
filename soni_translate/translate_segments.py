@@ -454,12 +454,12 @@ def gpt_batch(segments, model, target, token_batch_limit=900, source=None):
     )
 
 
-def call_gemini_translate(prompt, model=gemini_client):
-    response = model.generate_content(prompt)
+async def call_gemini_translate(prompt, model=gemini_client):
+    response = await model.generate_content(prompt)
     return response.text.strip() if hasattr(response, "text") else str(response)
 
 
-def gemini_context_translation(segments, target, source=None):
+async def gemini_context_translation(segments, target, source=None):
     segments_ = copy.deepcopy(segments)
     lang_tg = re.sub(r"\([^)]*\)", "", INVERTED_LANGUAGES[target]).strip()
     lang_sc = ""
@@ -476,7 +476,7 @@ def gemini_context_translation(segments, target, source=None):
         context_after = " ".join([s["text"] for s in segments_[i + 1 : i + 5]])
         prompt = f"""You are a professional translator.\n\nContext before:\n{context_before}\n\nContext after:\n{context_after}\n\nText to translate ({lang_sc} to {lang_tg}):\n{text}\n\nONLY return the translated text, nothing else."""
         try:
-            translated_text = call_gemini_translate(prompt)
+            translated_text = await call_gemini_translate(prompt)
         except Exception as error:
             logger.error(
                 f"Gemini error: {str(error)}; falling back to Google Translate for segment {start}"
@@ -487,7 +487,6 @@ def gemini_context_translation(segments, target, source=None):
         progress_bar.update(1)
     progress_bar.close()
     return segments_
-
 
 def translate_text(
     segments,
@@ -526,6 +525,6 @@ def translate_text(
         case "disable_translation":
             return segments
         case "gemini_context_translation":
-            return gemini_context_translation(segments, target, source)
+            return await gemini_context_translation(segments, target, source)
         case _:
             raise ValueError("No valid translation process")

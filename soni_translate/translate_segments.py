@@ -1,12 +1,20 @@
-from tqdm import tqdm
-from deep_translator import GoogleTranslator
-from itertools import chain
 import copy
-from .language_configuration import fix_code_language, INVERTED_LANGUAGES
-from .logging_setup import logger
-import re
 import json
+import os
+import re
 import time
+from itertools import chain
+
+from deep_translator import GoogleTranslator
+from tqdm import tqdm
+
+from .language_configuration import INVERTED_LANGUAGES, fix_code_language
+from .logging_setup import logger
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 TRANSLATION_PROCESS_OPTIONS = [
     "google_translator_batch",
@@ -16,12 +24,13 @@ TRANSLATION_PROCESS_OPTIONS = [
     "gpt-4-turbo-preview_batch",
     "gpt-4-turbo-preview",
     "disable_translation",
+    "gemini_context_translation"
 ]
 DOCS_TRANSLATION_PROCESS_OPTIONS = [
     "google_translator",
     "gpt-3.5-turbo-0125",
     "gpt-4-turbo-preview",
-    "disable_translation",
+    "disable_translation", #TODO: do I need gemini_context_translation here too?
 ]
 
 
@@ -48,9 +57,7 @@ def translate_iterative(segments, target, source=None):
 
     segments_ = copy.deepcopy(segments)
 
-    if (
-        not source
-    ):
+    if not source:
         logger.debug("No source language")
         source = "auto"
 
@@ -64,13 +71,7 @@ def translate_iterative(segments, target, source=None):
     return segments_
 
 
-def verify_translate(
-    segments,
-    segments_copy,
-    translated_lines,
-    target,
-    source
-):
+def verify_translate(segments, segments_copy, translated_lines, target, source):
     """
     Verify integrity and translate segments if lengths match, otherwise
     switch to iterative translation.
@@ -78,11 +79,11 @@ def verify_translate(
     if len(segments) == len(translated_lines):
         for line in range(len(segments_copy)):
             logger.debug(
-                f"{segments_copy[line]['text']} >> "
-                f"{translated_lines[line].strip()}"
+                f"{segments_copy[line]['text']} >> {translated_lines[line].strip()}"
             )
-            segments_copy[line]["text"] = translated_lines[
-                line].replace("\t", "").replace("\n", "").strip()
+            segments_copy[line]["text"] = (
+                translated_lines[line].replace("\t", "").replace("\n", "").strip()
+            )
         return segments_copy
     else:
         logger.error(
@@ -122,9 +123,7 @@ def translate_batch(segments, target, chunk_size=2000, source=None):
 
     segments_copy = copy.deepcopy(segments)
 
-    if (
-        not source
-    ):
+    if not source:
         logger.debug("No source language")
         source = "auto"
 
@@ -189,9 +188,7 @@ def translate_batch(segments, target, chunk_size=2000, source=None):
     # un chunk
     translated_lines = list(chain.from_iterable(split_list))
 
-    return verify_translate(
-        segments, segments_copy, translated_lines, target, source
-    )
+    return verify_translate(segments, segments_copy, translated_lines, target, source)
 
 
 def call_gpt_translate(
@@ -202,15 +199,14 @@ def call_gpt_translate(
     original_text=None,
     batch_lines=None,
 ):
-
     # https://platform.openai.com/docs/guides/text-generation/json-mode
     response = client.chat.completions.create(
         model=model,
         response_format={"type": "json_object"},
         messages=[
-          {"role": "system", "content": system_prompt},
-          {"role": "user", "content": user_prompt}
-        ]
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
     )
     result = response.choices[0].message.content
     logger.debug(f"Result: {str(result)}")
@@ -218,7 +214,7 @@ def call_gpt_translate(
     try:
         translation = json.loads(result)
     except Exception as error:
-        match_result = re.search(r'\{.*?\}', result)
+        match_result = re.search(r"\{.*?\}", result)
         if match_result:
             logger.error(str(error))
             json_str = match_result.group(0)
@@ -232,10 +228,8 @@ def call_gpt_translate(
             if isinstance(conversation, dict):
                 conversation = list(conversation.values())[0]
             if (
-                list(
-                    original_text["conversation"][0].values()
-                )[0].strip() ==
-                list(conversation[0].values())[0].strip()
+                list(original_text["conversation"][0].values())[0].strip()
+                == list(conversation[0].values())[0].strip()
             ):
                 continue
             if len(conversation) == batch_lines:
@@ -248,8 +242,7 @@ def call_gpt_translate(
 
         logger.debug(f"Data batch: {str(fix_conversation_length)}")
         logger.debug(
-            f"Lines Received: {len(fix_conversation_length)},"
-            f" expected: {batch_lines}"
+            f"Lines Received: {len(fix_conversation_length)}, expected: {batch_lines}"
         )
 
         return fix_conversation_length
@@ -275,10 +268,10 @@ def gpt_sequential(segments, model, target, source=None):
     client = OpenAI()
     progress_bar = tqdm(total=len(segments), desc="Translating")
 
-    lang_tg = re.sub(r'\([^)]*\)', '', INVERTED_LANGUAGES[target]).strip()
+    lang_tg = re.sub(r"\([^)]*\)", "", INVERTED_LANGUAGES[target]).strip()
     lang_sc = ""
     if source:
-        lang_sc = re.sub(r'\([^)]*\)', '', INVERTED_LANGUAGES[source]).strip()
+        lang_sc = re.sub(r"\([^)]*\)", "", INVERTED_LANGUAGES[source]).strip()
 
     fixed_target = fix_code_language(target)
     fixed_source = fix_code_language(source) if source else "auto"
@@ -305,9 +298,7 @@ def gpt_sequential(segments, model, target, source=None):
                 f"{str(error)} >> The text of segment {start} "
                 "is being corrected with Google Translate"
             )
-            translator = GoogleTranslator(
-                source=fixed_source, target=fixed_target
-            )
+            translator = GoogleTranslator(source=fixed_source, target=fixed_target)
             translated_text = translator.translate(text.strip())
 
         translated_segments[i]["text"] = translated_text.strip()
@@ -319,8 +310,8 @@ def gpt_sequential(segments, model, target, source=None):
 
 
 def gpt_batch(segments, model, target, token_batch_limit=900, source=None):
-    from openai import OpenAI
     import tiktoken
+    from openai import OpenAI
 
     token_batch_limit = max(100, (token_batch_limit - 40) // 2)
     progress_bar = tqdm(total=len(segments), desc="Translating")
@@ -328,10 +319,10 @@ def gpt_batch(segments, model, target, token_batch_limit=900, source=None):
     encoding = tiktoken.get_encoding("cl100k_base")
     client = OpenAI()
 
-    lang_tg = re.sub(r'\([^)]*\)', '', INVERTED_LANGUAGES[target]).strip()
+    lang_tg = re.sub(r"\([^)]*\)", "", INVERTED_LANGUAGES[target]).strip()
     lang_sc = ""
     if source:
-        lang_sc = re.sub(r'\([^)]*\)', '', INVERTED_LANGUAGES[source]).strip()
+        lang_sc = re.sub(r"\([^)]*\)", "", INVERTED_LANGUAGES[source]).strip()
 
     fixed_target = fix_code_language(target)
     fixed_source = fix_code_language(source) if source else "auto"
@@ -351,10 +342,10 @@ def gpt_batch(segments, model, target, token_batch_limit=900, source=None):
         index_sk = int(speaker[-2:])
         character_sk = name_speaker[index_sk]
         count_sk[character_sk] += 1
-        code_sk = character_sk+str(count_sk[character_sk])
+        code_sk = character_sk + str(count_sk[character_sk])
         text_data_dict.append({code_sk: text})
         num_tokens += len(encoding.encode(text)) + 7
-        if num_tokens >= token_batch_limit or i == len(segments_copy)-1:
+        if num_tokens >= token_batch_limit or i == len(segments_copy) - 1:
             try:
                 batch_lines = len(text_data_dict)
                 batch_conversation = {"conversation": copy.deepcopy(text_data_dict)}
@@ -384,7 +375,7 @@ def gpt_batch(segments, model, target, token_batch_limit=900, source=None):
                     )
 
                 for i, translated_text in enumerate(conversation):
-                    if i+1 > batch_lines:
+                    if i + 1 > batch_lines:
                         break
                     translated_lines.append(list(translated_text.values())[0])
 
@@ -393,16 +384,13 @@ def gpt_batch(segments, model, target, token_batch_limit=900, source=None):
             except Exception as error:
                 logger.error(str(error))
 
-                first_start = segments_copy[max(0, i-(batch_lines-1))]["start"]
+                first_start = segments_copy[max(0, i - (batch_lines - 1))]["start"]
                 logger.warning(
                     f"The batch from {first_start} to {last_start} "
                     "failed, is being corrected with Google Translate"
                 )
 
-                translator = GoogleTranslator(
-                    source=fixed_source,
-                    target=fixed_target
-                )
+                translator = GoogleTranslator(source=fixed_source, target=fixed_target)
 
                 for txt_source in batch_conversation["conversation"]:
                     translated_txt = translator.translate(
@@ -418,10 +406,52 @@ def gpt_batch(segments, model, target, token_batch_limit=900, source=None):
     )
 
 
+def get_gemini_client():
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    return genai.GenerativeModel("gemini-2.5-pro")
+
+
+def call_gemini_translate(prompt, model=None):
+    if model is None:
+        model = get_gemini_client()
+    response = model.generate_content(prompt)
+    return response.text.strip() if hasattr(response, "text") else str(response)
+
+
+def gemini_context_translation(segments, target, source=None):
+    segments_ = copy.deepcopy(segments)
+    lang_tg = re.sub(r"\([^)]*\)", "", INVERTED_LANGUAGES[target]).strip()
+    lang_sc = ""
+    if source:
+        lang_sc = re.sub(r"\([^)]*\)", "", INVERTED_LANGUAGES[source]).strip()
+    fixed_target = fix_code_language(target)
+    fixed_source = fix_code_language(source) if source else "auto"
+    progress_bar = tqdm(total=len(segments_), desc="Translating (Gemini)")
+    for i, line in enumerate(segments_):
+        text = line["text"].strip()
+        start = line.get("start", i)
+        # Context window: 4 before, 4 after
+        context_before = " ".join([s["text"] for s in segments_[max(0, i - 4) : i]])
+        context_after = " ".join([s["text"] for s in segments_[i + 1 : i + 5]])
+        prompt = f"""You are a professional translator.\n\nContext before:\n{context_before}\n\nContext after:\n{context_after}\n\nText to translate ({lang_sc} to {lang_tg}):\n{text}\n\nONLY return the translated text, nothing else."""
+        try:
+            translated_text = call_gemini_translate(prompt)
+        except Exception as error:
+            logger.error(
+                f"Gemini error: {str(error)}; falling back to Google Translate for segment {start}"
+            )
+            translator = GoogleTranslator(source=fixed_source, target=fixed_target)
+            translated_text = translator.translate(text)
+        segments_[i]["text"] = translated_text.strip()
+        progress_bar.update(1)
+    progress_bar.close()
+    return segments_
+
+
 def translate_text(
     segments,
     target,
-    translation_process="google_translator_batch",
+    translation_process="gemini_context_translation",
     chunk_size=4500,
     source=None,
     token_batch_limit=1000,
@@ -433,25 +463,28 @@ def translate_text(
                 segments,
                 fix_code_language(target),
                 chunk_size,
-                fix_code_language(source)
+                fix_code_language(source),
             )
         case "google_translator":
             return translate_iterative(
-                segments,
-                fix_code_language(target),
-                fix_code_language(source)
+                segments, fix_code_language(target), fix_code_language(source)
             )
         case model if model in ["gpt-3.5-turbo-0125", "gpt-4-turbo-preview"]:
             return gpt_sequential(segments, model, target, source)
-        case model if model in ["gpt-3.5-turbo-0125_batch", "gpt-4-turbo-preview_batch",]:
+        case model if model in [
+            "gpt-3.5-turbo-0125_batch",
+            "gpt-4-turbo-preview_batch",
+        ]:
             return gpt_batch(
                 segments,
                 translation_process.replace("_batch", ""),
                 target,
                 token_batch_limit,
-                source
+                source,
             )
         case "disable_translation":
             return segments
+        case "gemini_context_translation":
+            return gemini_context_translation(segments, target, source)
         case _:
             raise ValueError("No valid translation process")

@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import functools
 import json
@@ -459,6 +460,23 @@ async def call_gemini_translate(prompt, model=gemini_client):
     return response.text.strip() if hasattr(response, "text") else str(response)
 
 
+async def _translate_segment_with_context(i, segments_, lang_sc, lang_tg, fixed_source, fixed_target):
+    text = segments_[i]["text"].strip()
+    start = segments_[i].get("start", i)
+    context_before = " ".join([s["text"] for s in segments_[max(0, i - 4):i]])
+    context_after = " ".join([s["text"] for s in segments_[i + 1:i + 5]])
+    prompt = f"""You are a professional translator.\n\nContext before:\n{context_before}\n\nContext after:\n{context_after}\n\nText to translate ({lang_sc} to {lang_tg}):\n{text}\n\nONLY return the translated text, nothing else."""
+    try:
+        translated_text = await call_gemini_translate(prompt)
+    except Exception as error:
+        logger.error(
+            f"Gemini error: {str(error)}; falling back to Google Translate for segment {start}"
+        )
+        translator = GoogleTranslator(source=fixed_source, target=fixed_target)
+        translated_text = translator.translate(text)
+    return i, translated_text.strip()
+
+
 async def gemini_context_translation(segments, target, source=None):
     segments_ = copy.deepcopy(segments)
     lang_tg = re.sub(r"\([^)]*\)", "", INVERTED_LANGUAGES[target]).strip()
@@ -467,26 +485,19 @@ async def gemini_context_translation(segments, target, source=None):
         lang_sc = re.sub(r"\([^)]*\)", "", INVERTED_LANGUAGES[source]).strip()
     fixed_target = fix_code_language(target)
     fixed_source = fix_code_language(source) if source else "auto"
-    progress_bar = tqdm(total=len(segments_), desc="Translating (Gemini)")
-    for i, line in enumerate(segments_):
-        text = line["text"].strip()
-        start = line.get("start", i)
-        # Context window: 4 before, 4 after
-        context_before = " ".join([s["text"] for s in segments_[max(0, i - 4) : i]])
-        context_after = " ".join([s["text"] for s in segments_[i + 1 : i + 5]])
-        prompt = f"""You are a professional translator.\n\nContext before:\n{context_before}\n\nContext after:\n{context_after}\n\nText to translate ({lang_sc} to {lang_tg}):\n{text}\n\nONLY return the translated text, nothing else."""
-        try:
-            translated_text = await call_gemini_translate(prompt)
-        except Exception as error:
-            logger.error(
-                f"Gemini error: {str(error)}; falling back to Google Translate for segment {start}"
-            )
-            translator = GoogleTranslator(source=fixed_source, target=fixed_target)
-            translated_text = translator.translate(text)
-        segments_[i]["text"] = translated_text.strip()
-        progress_bar.update(1)
-    progress_bar.close()
+
+    tasks = [
+        _translate_segment_with_context(i, segments_, lang_sc, lang_tg, fixed_source, fixed_target)
+        for i in range(len(segments_))
+    ]
+    results = await asyncio.gather(*tasks)
+
+    # Assign results back to segments_
+    for i, translated_text in results:
+        segments_[i]["text"] = translated_text
+
     return segments_
+
 
 def translate_text(
     segments,
@@ -525,6 +536,6 @@ def translate_text(
         case "disable_translation":
             return segments
         case "gemini_context_translation":
-            return await gemini_context_translation(segments, target, source)
+            return asyncio.run(gemini_context_translation(segments, target, source))
         case _:
             raise ValueError("No valid translation process")

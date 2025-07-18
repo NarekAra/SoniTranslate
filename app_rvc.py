@@ -946,6 +946,225 @@ class SoniTranslate(SoniTrCache):
             logger.info(f"Done: {msg_out}")
             return output
 
+        if not self.task_in_cache("tts", [
+            TRANSLATE_AUDIO_TO,
+            tts_voice00,
+            tts_voice01,
+            tts_voice02,
+            tts_voice03,
+            tts_voice04,
+            tts_voice05,
+            tts_voice06,
+            tts_voice07,
+            tts_voice08,
+            tts_voice09,
+            tts_voice10,
+            tts_voice11,
+            dereverb_automatic_xtts
+        ], {
+            "sub_file": self.sub_file
+        }):
+            prog_disp("Text to speech...", 0.80, is_gui, progress=progress)
+            self.valid_speakers = audio_segmentation_to_voice(
+                self.result_diarize,
+                TRANSLATE_AUDIO_TO,
+                is_gui,
+                tts_voice00,
+                tts_voice01,
+                tts_voice02,
+                tts_voice03,
+                tts_voice04,
+                tts_voice05,
+                tts_voice06,
+                tts_voice07,
+                tts_voice08,
+                tts_voice09,
+                tts_voice10,
+                tts_voice11,
+                dereverb_automatic_xtts,
+            )
+
+        if not self.task_in_cache("acc_and_vc", [
+            max_accelerate_audio,
+            acceleration_rate_regulation,
+            voice_imitation,
+            voice_imitation_max_segments,
+            voice_imitation_remove_previous,
+            voice_imitation_vocals_dereverb,
+            voice_imitation_method,
+            custom_voices,
+            custom_voices_workers,
+            copy.deepcopy(self.vci.model_config),
+            avoid_overlap
+        ], {
+            "valid_speakers": self.valid_speakers
+        }):
+            audio_files, speakers_list = accelerate_segments(
+                    self.result_diarize,
+                    max_accelerate_audio,
+                    self.valid_speakers,
+                    acceleration_rate_regulation,
+                )
+
+            # Voice Imitation (Tone color converter)
+            if voice_imitation:
+                prog_disp(
+                    "Voice Imitation...", 0.85, is_gui, progress=progress
+                )
+                from soni_translate.text_to_speech import toneconverter
+
+                try:
+                    toneconverter(
+                        copy.deepcopy(self.result_diarize),
+                        voice_imitation_max_segments,
+                        voice_imitation_remove_previous,
+                        voice_imitation_vocals_dereverb,
+                        voice_imitation_method,
+                    )
+                except Exception as error:
+                    logger.error(str(error))
+
+            # custom voice
+            if custom_voices:
+                prog_disp(
+                    "Applying customized voices...",
+                    0.90,
+                    is_gui,
+                    progress=progress,
+                )
+
+                try:
+                    self.vci(
+                        audio_files,
+                        speakers_list,
+                        overwrite=True,
+                        parallel_workers=custom_voices_workers,
+                    )
+                    self.vci.unload_models()
+                except Exception as error:
+                    logger.error(str(error))
+
+            prog_disp(
+                "Creating final translated video...",
+                0.95,
+                is_gui,
+                progress=progress,
+            )
+            remove_files(dub_audio_file)
+            create_translated_audio(
+                self.result_diarize,
+                audio_files,
+                dub_audio_file,
+                False,
+                avoid_overlap,
+            )
+
+        # Voiceless track, change with file
+        hash_base_audio_wav = get_hash(base_audio_wav)
+        if voiceless_track:
+            if self.voiceless_id != hash_base_audio_wav:
+                from soni_translate.mdx_net import process_uvr_task
+
+                try:
+                    # voiceless_audio_file_dir = "clean_song_output/voiceless"
+                    remove_files(voiceless_audio_file)
+                    uvr_voiceless_audio_wav, _ = process_uvr_task(
+                        orig_song_path=base_audio_wav,
+                        song_id="voiceless",
+                        only_voiceless=True,
+                        remove_files_output_dir=False,
+                    )
+                    copy_files(uvr_voiceless_audio_wav, ".")
+                    base_audio_wav = voiceless_audio_file
+                    self.voiceless_id = hash_base_audio_wav
+
+                except Exception as error:
+                    logger.error(str(error))
+            else:
+                base_audio_wav = voiceless_audio_file
+
+        if not self.task_in_cache("mix_aud", [
+            mix_method_audio,
+            volume_original_audio,
+            volume_translated_audio,
+            voiceless_track
+        ], {}):
+            # TYPE MIX AUDIO
+            remove_files(mix_audio_file)
+            command_volume_mix = f'ffmpeg -y -i {base_audio_wav} -i {dub_audio_file} -filter_complex "[0:0]volume={volume_original_audio}[a];[1:0]volume={volume_translated_audio}[b];[a][b]amix=inputs=2:duration=longest" -c:a libmp3lame {mix_audio_file}'
+            command_background_mix = f'ffmpeg -i {base_audio_wav} -i {dub_audio_file} -filter_complex "[1:a]asplit=2[sc][mix];[0:a][sc]sidechaincompress=threshold=0.003:ratio=20[bg]; [bg][mix]amerge[final]" -map [final] {mix_audio_file}'
+            if mix_method_audio == "Adjusting volumes and mixing audio":
+                # volume mix
+                run_command(command_volume_mix)
+            else:
+                try:
+                    # background mix
+                    run_command(command_background_mix)
+                except Exception as error_mix:
+                    # volume mix except
+                    logger.error(str(error_mix))
+                    run_command(command_volume_mix)
+
+        if "audio" in output_type or is_audio_file(media_file):
+            output = media_out(
+                media_file,
+                TRANSLATE_AUDIO_TO,
+                video_output_name,
+                "wav" if "wav" in output_type else (
+                    "ogg" if "ogg" in output_type else "mp3"
+                ),
+                file_obj=mix_audio_file,
+                subtitle_files=output_format_subtitle,
+            )
+            msg_out = output[0] if isinstance(output, list) else output
+            logger.info(f"Done: {msg_out}")
+            return output
+
+        hash_base_video_file = get_hash(base_video_file)
+
+        if burn_subtitles_to_video:
+            hashvideo_text = [
+                hash_base_video_file,
+                [seg["text"] for seg in self.result_diarize["segments"]]
+            ]
+            if self.burn_subs_id != hashvideo_text:
+                try:
+                    logger.info("Burn subtitles")
+                    remove_files(vid_subs)
+                    command = f"ffmpeg -i {base_video_file} -y -vf subtitles=sub_tra.srt -max_muxing_queue_size 9999 {vid_subs}"
+                    run_command(command)
+                    base_video_file = vid_subs
+                    self.burn_subs_id = hashvideo_text
+                except Exception as error:
+                    logger.error(str(error))
+            else:
+                base_video_file = vid_subs
+
+        if not self.task_in_cache("output", [
+            hash_base_video_file,
+            hash_base_audio_wav,
+            burn_subtitles_to_video
+        ], {}):
+            # Merge new audio + video
+            remove_files(video_output_file)
+            run_command(
+                f"ffmpeg -i {base_video_file} -i {mix_audio_file} -c:v copy -c:a copy -map 0:v -map 1:a -shortest {video_output_file}"
+            )
+
+        output = media_out(
+            media_file,
+            TRANSLATE_AUDIO_TO,
+            video_output_name,
+            "mkv" if "mkv" in output_type else "mp4",
+            file_obj=video_output_file,
+            soft_subtitles=soft_subtitles_to_video,
+            subtitle_files=output_format_subtitle,
+        )
+        msg_out = output[0] if isinstance(output, list) else output
+        logger.info(f"Done: {msg_out}")
+
+        return output
+
     def hook_beta_processor(
         self,
         document,

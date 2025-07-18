@@ -58,7 +58,9 @@ class LLMClient:
         prompt: str,
     ) -> str:
         """Generate content using the LLM with template-specific temperature."""
-        response = await self.client.models.generate_content(
+        # Run the blocking call in a thread to avoid blocking the event loop
+        response = await asyncio.to_thread(
+            self.client.models.generate_content,
             contents=prompt,
             model=MODEL_NAME,
         )

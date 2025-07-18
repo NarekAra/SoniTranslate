@@ -1,21 +1,69 @@
 import copy
+import functools
 import json
 import os
 import re
 import time
 from itertools import chain
 
+import dotenv
 from deep_translator import GoogleTranslator
+from google import genai
 from tqdm import tqdm
 
 from .language_configuration import INVERTED_LANGUAGES, fix_code_language
 from .logging_setup import logger
 
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
+dotenv.load_dotenv()
+GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
+MODEL_NAME = "gemini-2.5-flash"
 
+
+def retry_with_model_switch(max_retries=3, backoff_factor=2):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return func(self, *args, **kwargs)
+                except Exception as e:
+                    if "blocked" in str(e).lower():  # Check for blocked message error
+                        print(
+                            "Blocked message error detected. (Model switching not implemented, skipping...)"
+                        )
+                        # Model switching logic could go here
+                        # self.model = genai.GenerativeModel(Config.ALTERNATIVE_MODEL_NAME)
+                    else:
+                        print(f"Error: {e}. Retrying {retries + 1}/{max_retries}...")
+                        time.sleep(backoff_factor**retries)  # Exponential backoff
+
+                    retries += 1
+
+            raise Exception("Max retries exceeded. Unable to generate content.")
+
+        return wrapper
+
+    return decorator
+
+
+class LLMClient:
+    def __init__(self):
+        self.client = genai.Client()
+
+    @retry_with_model_switch(max_retries=3, backoff_factor=2)
+    async def generate_content(
+        self,
+        prompt: str,
+    ) -> str:
+        """Generate content using the LLM with template-specific temperature."""
+        response = await self.client.models.generate_content(
+            contents=prompt,
+            model=MODEL_NAME,
+        )
+        return response.text
+
+gemini_client = LLMClient()
 TRANSLATION_PROCESS_OPTIONS = [
     "google_translator_batch",
     "google_translator",
@@ -406,14 +454,7 @@ def gpt_batch(segments, model, target, token_batch_limit=900, source=None):
     )
 
 
-def get_gemini_client():
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    return genai.GenerativeModel("gemini-2.5-pro")
-
-
-def call_gemini_translate(prompt, model=None):
-    if model is None:
-        model = get_gemini_client()
+def call_gemini_translate(prompt, model=gemini_client):
     response = model.generate_content(prompt)
     return response.text.strip() if hasattr(response, "text") else str(response)
 

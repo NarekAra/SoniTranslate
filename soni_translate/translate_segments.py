@@ -468,14 +468,8 @@ async def _translate_segment_with_context(i, segments_, lang_sc, lang_tg, fixed_
     context_before = " ".join([s["text"] for s in segments_[max(0, i - 4):i]])
     context_after = " ".join([s["text"] for s in segments_[i + 1:i + 5]])
     prompt = f"""You are a professional translator.\n\nContext before:\n{context_before}\n\nContext after:\n{context_after}\n\nText to translate ({lang_sc} to {lang_tg}):\n{text}\n\nONLY return the translated text, nothing else."""
-    try:
-        translated_text = await call_gemini_translate(prompt)
-    except Exception as error:
-        logger.error(
-            f"Gemini error: {str(error)}; falling back to Google Translate for segment {start}"
-        )
-        translator = GoogleTranslator(source=fixed_source, target=fixed_target)
-        translated_text = translator.translate(text)
+    logger.info(f"prompt {prompt}")
+    translated_text = await call_gemini_translate(prompt)
     return i, translated_text.strip()
 
 
@@ -488,14 +482,23 @@ async def gemini_context_translation(segments, target, source=None):
     fixed_target = fix_code_language(target)
     fixed_source = fix_code_language(source) if source else "auto"
 
-    tasks = [
-        _translate_segment_with_context(i, segments_, lang_sc, lang_tg, fixed_source, fixed_target)
-        for i in range(len(segments_))
-    ]
-    results = await asyncio.gather(*tasks)
+    batch_size = 10
+    total_segments = len(segments_)
+    results = [None] * total_segments
+    for batch_start in range(0, total_segments, batch_size):
+        batch_end = min(batch_start + batch_size, total_segments)
+        logger.info(f"Processing translation batch {batch_start} to {batch_end - 1} of {total_segments}")
+        tasks = [
+            _translate_segment_with_context(i, segments_, lang_sc, lang_tg, fixed_source, fixed_target)
+            for i in range(batch_start, batch_end)
+        ]
+        batch_results = await asyncio.gather(*tasks)
+        for i, translated_text in batch_results:
+            results[i] = translated_text
+        logger.info(f"Completed {batch_end} of {total_segments} segments.")
 
     # Assign results back to segments_
-    for i, translated_text in results:
+    for i, translated_text in enumerate(results):
         segments_[i]["text"] = translated_text
 
     return segments_
